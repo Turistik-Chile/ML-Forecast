@@ -1,0 +1,8 @@
+.chart-container {
+  --chart-bg: hsl(var(--background));
+  --chart-fg: hsl(var(--foreground));
+  --chart-primary: hsl(var(--primary));
+  --chart-accent: hsl(var(--accent));
+  --chart-muted: hsl(var(--muted));
+  --chart-muted-foreground: hsl(var(--muted-foreground));
+}

@@ -1,0 +1,14 @@
+numpy
+pandas
+matplotlib
+scikit-learn
+prophet
+statsmodels
+scipy
+plotly
+xgboost
+fastapi
+uvicorn
+requests
+dotenv
+pyodbc
