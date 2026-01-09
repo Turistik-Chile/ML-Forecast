@@ -1,6 +1,8 @@
 # API Backend (FastAPI)
 
-Base URL local: `http://localhost:8000`
+Base URL local: `http://127.0.0.1:8000` // O la que se defina al levantar FastAPI. Para ajustar este link: frontend/src/services/api.ts
+Levantar API: situarse en backend y ejecutar "python -m uvicorn main:app --reload --port 8000"
+Levantar Front: situarse en frontend y ejecutar "npm run dev"
 
 ## Salud
 - `GET /health`  

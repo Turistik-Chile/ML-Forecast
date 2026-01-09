@@ -40,6 +40,7 @@ from configuracion_endpoints import (
     router as configuracion_router,
     listar_configuraciones_db,
 )
+from dataset_persistence import persist_dataset_to_db
 from exogena_endpoints import router as exogena_router
 
 
@@ -47,6 +48,7 @@ from exogena_endpoints import router as exogena_router
 # CONFIGURACION
 # -----------------------------
 LOG_DIR = Path("logs")
+FLOW_LOG_DIR = LOG_DIR / "flow_reports"
 LOCATION_CHOICES = get_open_meteo_location_names()
 DEFAULT_BATCH_LOCATIONS = ("santiago", "valparaiso")
 FRONTEND_ALLOWED_ORIGINS = ["http://localhost:5173"]
@@ -103,16 +105,8 @@ class ModelHandlers(TypedDict):
 
 MODEL_REGISTRY: Dict[str, ModelHandlers] = {
     "random_forest": {
-        "train": lambda data: entrenar_random_forest(data.X_train, data.y_train),
-        "forecast": lambda model, data: forecast_random_forest(
-            model,
-            data.feature_columns,
-            data.history,
-            data.test_range[0],
-            data.test_range[1],
-            data.lags,
-            data.exogenas,
-        ),
+        "train": lambda data: entrenar_random_forest(data),
+        "forecast": lambda model, data: forecast_random_forest(model, data),
     },
     "prophet": {
         "train": lambda data: entrenar_prophet_model(data.history, data.exogenas),
@@ -210,7 +204,9 @@ class ForecastRequest(BaseModel):
     def normalized_lags(self) -> List[int] | None:
         if not self.lags:
             return None
-        normalized = sorted({lag for lag in self.lags if isinstance(lag, int) and lag > 0})
+        normalized = sorted(
+            {lag for lag in self.lags if isinstance(lag, int) and lag > 0}
+        )
         if not normalized:
             raise ValueError("Los lags deben ser enteros positivos.")
         return normalized
@@ -236,6 +232,7 @@ class ForecastResponse(BaseModel):
     timestamp: str
     plot_path: str
     plot_image: str | None = None
+    dataset_table: str | None = None
     forecast: List[ForecastPoint]
 
 
@@ -272,7 +269,9 @@ def _format_lag_label(lags):
     return ", ".join(str(lag) for lag in lags)
 
 
-def _normalize_to_dataframe(series_or_df: pd.Series | pd.DataFrame | None) -> pd.DataFrame | None:
+def _normalize_to_dataframe(
+    series_or_df: pd.Series | pd.DataFrame | None,
+) -> pd.DataFrame | None:
     """Return a DataFrame view for either a Series or DataFrame (None preserved)."""
     if series_or_df is None:
         return None
@@ -291,10 +290,7 @@ def _render_dataframe_section(name: str, df: pd.DataFrame | None) -> str:
         html_table = df.head(200).to_html(index=True, justify="left")
     except Exception as exc:  # pragma: no cover - defensivo ante tablas inusuales
         html_table = f"<p>No se pudo renderizar la tabla: {exc}</p>"
-    return (
-        f"<section><h2>{name} (shape={df.shape})</h2>"
-        f"{html_table}</section>"
-    )
+    return f"<section><h2>{name} (shape={df.shape})</h2>" f"{html_table}</section>"
 
 
 def _dump_dataset_csv(writer, label: str, df: pd.DataFrame | None) -> None:
@@ -318,7 +314,9 @@ def _get_dump_datasets(data: PreparedData) -> list[tuple[str, pd.DataFrame | Non
     ]
 
 
-def _dump_prepared_dataframes_csv(model_name: str, datasets: list[tuple[str, pd.DataFrame | None]], timestamp: str) -> None:
+def _dump_prepared_dataframes_csv(
+    model_name: str, datasets: list[tuple[str, pd.DataFrame | None]], timestamp: str
+) -> None:
     dump_dir = LOG_DIR / "dataframes"
     dump_dir.mkdir(parents=True, exist_ok=True)
     csv_path = dump_dir / f"{model_name}_{timestamp}.csv"
@@ -342,15 +340,134 @@ def _dump_prepared_dataframes(model_name: str, data: PreparedData) -> None:
     content = (
         "<html><head><meta charset='utf-8'><title>Pipeline DataFrames</title></head>"
         "<body>"
-        f"<h1>{model_name} - {timestamp}</h1>"
-        + "".join(sections)
-        + "</body></html>"
+        f"<h1>{model_name} - {timestamp}</h1>" + "".join(sections) + "</body></html>"
     )
 
     path = dump_dir / f"{model_name}_{timestamp}.html"
     path.write_text(content, encoding="utf-8")
     logging.info("Se guardaron tablas de entrenamiento para %s en %s", model_name, path)
     _dump_prepared_dataframes_csv(model_name, datasets, timestamp)
+
+
+def _df_stats(df: pd.DataFrame | None) -> str:
+    if df is None:
+        return "None"
+    shape = f"shape={df.shape}"
+    if df.empty:
+        return f"empty ({shape})"
+    if isinstance(df.index, pd.DatetimeIndex) and not df.index.empty:
+        return f"{shape} | range={df.index.min().date()} -> {df.index.max().date()}"
+    return shape
+
+
+def _build_flow_report(
+    pipeline_name: str,
+    model_name: str,
+    data: PreparedData,
+    exog_columns: list[str],
+    expected_from_loader: list[str],
+) -> tuple[str, list[str]]:
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    exog_reference = expected_from_loader or exog_columns
+    history_cols = [
+        c
+        for c in (data.history.columns.tolist() if data.history is not None else [])
+        if c != "valor"
+    ]
+    real_cols = (
+        [
+            c
+            for c in (data.df_real.columns.tolist() if data.df_real is not None else [])
+            if c != "valor"
+        ]
+        if data.df_real is not None
+        else []
+    )
+    feature_cols = list(data.feature_columns or [])
+
+    exog_index = data.exogenas.index if data.exogenas is not None else None
+    history_index = data.history.index if data.history is not None else None
+    real_index = data.df_real.index if data.df_real is not None else None
+
+    def _missing_coverage(target_index: pd.Index | None) -> tuple[int, str] | None:
+        if exog_index is None or target_index is None:
+            return None
+        target_dt = pd.DatetimeIndex(target_index)
+        exog_dt = pd.DatetimeIndex(exog_index)
+        missing = target_dt.difference(exog_dt)
+        if missing.empty:
+            return None
+        return len(missing), f"{missing.min().date()} -> {missing.max().date()}"
+
+    missing_hist_cov = _missing_coverage(history_index)
+    missing_real_cov = _missing_coverage(real_index)
+
+    missing_history = [c for c in exog_reference if c not in history_cols]
+    missing_features = [c for c in exog_reference if c not in feature_cols]
+    missing_real = (
+        [c for c in exog_reference if c not in real_cols] if exog_reference else []
+    )
+
+    warnings: list[str] = []
+    if not exog_reference:
+        warnings.append(
+            "Sin exogenas detectadas/esperadas; los modelos correran sin variables externas."
+        )
+    if missing_history:
+        warnings.append(f"Exogenas ausentes en history: {missing_history}")
+    if missing_features:
+        warnings.append(
+            f"Exogenas no incluidas en feature_columns (no impactaran el modelo): {missing_features}"
+        )
+    if missing_real and data.df_real is not None:
+        warnings.append(f"Exogenas ausentes en df_real/comparacion: {missing_real}")
+    if missing_hist_cov:
+        warnings.append(
+            f"Cobertura incompleta de exogenas en history: faltan {missing_hist_cov[0]} dias "
+            f"({missing_hist_cov[1]}), se rellenan con 0."
+        )
+    if missing_real_cov:
+        warnings.append(
+            f"Cobertura incompleta de exogenas en df_real/forecast: faltan {missing_real_cov[0]} dias "
+            f"({missing_real_cov[1]}), se rellenan con 0."
+        )
+
+    status = "OK" if not warnings else "WARN"
+    lines = [
+        f"# Flow diagnostics :: {pipeline_name} / {model_name}",
+        f"- timestamp: {timestamp}",
+        f"- status: {status}",
+        f"- lags: {data.lags} | zero_padding_days: {data.zero_padding_days} | forecast_only: {data.forecast_only}",
+        "- datasets:",
+        f"  * history: {_df_stats(data.history)}",
+        f"  * df_real: {_df_stats(data.df_real)}",
+        f"  * X_train: {_df_stats(data.X_train)}",
+        f"  * exogenas: {_df_stats(data.exogenas)}",
+        "- exogenas:",
+        f"  * esperadas (loader o detectadas): {exog_reference or 'None'}",
+        f"  * en history: {history_cols or 'None'}",
+        f"  * en feature_columns: {feature_cols or 'None'}",
+        f"  * en df_real: {real_cols or 'None'}",
+        f"  * cobertura exogenas: range={_df_stats(data.exogenas)}",
+    ]
+    if warnings:
+        lines.append("- warnings:")
+        for w in warnings:
+            lines.append(f"  * {w}")
+    else:
+        lines.append("- warnings: None")
+    report = "\n".join(lines)
+    return report, warnings
+
+
+def _write_flow_report(pipeline_name: str, model_name: str, report: str) -> Path:
+    FLOW_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    filename = (
+        f"{pipeline_name}_{model_name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.md"
+    )
+    path = FLOW_LOG_DIR / filename
+    path.write_text(report, encoding="utf-8")
+    return path
 
 
 def graficar(
@@ -445,10 +562,14 @@ def ejecutar_forecast(
     )
 
     expected_from_loader = (
-        data.exogenas.attrs.get("expected_exogenas") if data.exogenas is not None else []
+        data.exogenas.attrs.get("expected_exogenas")
+        if data.exogenas is not None
+        else []
     )
     if expected_from_loader:
-        missing_expected = [col for col in expected_from_loader if col not in exog_columns]
+        missing_expected = [
+            col for col in expected_from_loader if col not in exog_columns
+        ]
         if missing_expected:
             logging.warning(
                 "%s: faltan columnas esperadas desde loader: %s",
@@ -460,6 +581,34 @@ def ejecutar_forecast(
                 "%s: todas las exogenas esperadas presentes antes de entrenar.",
                 pipeline_name,
             )
+
+    dataset_table = None
+    try:
+        options = pipeline_kwargs or {}
+        categories = options.get("categories")
+        dataset_table = persist_dataset_to_db(
+            data.history,
+            pipeline_name=pipeline_name,
+            model_name=model_name,
+            configuration_id=options.get("configuration_id"),
+            categories=categories,
+            start_date=data.train_range[0] if data.train_range else None,
+            end_date=data.train_range[1] if data.train_range else None,
+        )
+    except Exception as exc:
+        logging.warning("No se pudo persistir el dataset: %s", exc)
+
+    report, flow_warnings = _build_flow_report(
+        pipeline_name,
+        model_name,
+        data,
+        exog_columns,
+        expected_from_loader,
+    )
+    report_path = _write_flow_report(pipeline_name, model_name, report)
+    logging.info("Flow diagnostics guardado en %s", report_path)
+    for warn in flow_warnings:
+        logging.warning("%s", warn)
 
     _dump_prepared_dataframes(model_name, data)
     model_handlers = get_model_handlers(model_name)
@@ -544,6 +693,7 @@ def ejecutar_forecast(
         timestamp=timestamp,
         plot_path=str(plot_path),
         plot_image=_encode_plot_base64(plot_path),
+        dataset_table=dataset_table,
         forecast=forecast_rows,
     )
 
@@ -632,6 +782,8 @@ def main(
     print(f"MAE  = {mae_label}")
     print(f"RMSE = {rmse_label}")
     print(f"Grafico generado: {resultado.plot_path}")
+    if resultado.dataset_table:
+        print(f"Dataset persistido: {resultado.dataset_table}")
     return resultado
 
 
@@ -688,7 +840,9 @@ def options():
     try:
         turismo_dates = get_turismo_date_bounds()
     except Exception as exc:  # pragma: no cover - logging auxiliar
-        logging.warning("No fue posible obtener el rango disponible de turismo: %s", exc)
+        logging.warning(
+            "No fue posible obtener el rango disponible de turismo: %s", exc
+        )
     try:
         configuraciones = listar_configuraciones_db()
     except Exception as exc:  # pragma: no cover - logging auxiliar
@@ -710,7 +864,9 @@ def options():
 def forecast_endpoint(request: ForecastRequest):
     try:
         if request.forecast_only and not request.forecast_end_date:
-            raise ValueError("Debes indicar 'forecast_end_date' cuando 'forecast_only' es True.")
+            raise ValueError(
+                "Debes indicar 'forecast_end_date' cuando 'forecast_only' es True."
+            )
         pipeline_kwargs = request.build_pipeline_kwargs()
         label = resolve_location_label(request.pipeline, pipeline_kwargs)
         return ejecutar_forecast(
@@ -727,7 +883,7 @@ def forecast_endpoint(request: ForecastRequest):
 
 
 if __name__ == "__main__":
-    # Para cambiar a correr todos los flujos, comentar las dos lÃƒÆ’Ã‚Â­neas siguientes y quitar el comentario a la llamada de run_all_flows
+    # Para cambiar a correr todos los flujos, comentar las dos  siguientes y quitar el comentario a la llamada de run_all_flows
     args = parse_args()
     pipeline_kwargs: Dict[str, Any] = {}
     if args.location:
@@ -739,7 +895,9 @@ if __name__ == "__main__":
     if args.categories is not None:
         pipeline_kwargs["categories"] = args.categories
     if args.lags:
-        pipeline_kwargs["lags"] = sorted({lag for lag in args.lags if lag is not None and lag > 0})
+        pipeline_kwargs["lags"] = sorted(
+            {lag for lag in args.lags if lag is not None and lag > 0}
+        )
     if args.forecast_only:
         pipeline_kwargs["forecast_only"] = True
     if args.forecast_end_date:

@@ -24,7 +24,7 @@ const ForecastChart = ({ data, forecastOnly = false }: ForecastChartProps) => {
       data.map((point) => {
         const date = new Date(point.fecha);
         return {
-          fecha: date,
+          fecha: date.getTime(),
           fechaLabel: date.toLocaleDateString("es-CL", {
             month: "short",
             day: "numeric",
@@ -61,11 +61,19 @@ const ForecastChart = ({ data, forecastOnly = false }: ForecastChartProps) => {
               </defs>
               <CartesianGrid strokeDasharray="4 4" stroke="var(--chart-muted)" />
               <XAxis
-                dataKey="fechaLabel"
+                dataKey="fecha"
+                type="number"
+                domain={["dataMin", "dataMax"]}
                 stroke="var(--chart-muted-foreground)"
                 tickLine={false}
                 axisLine={false}
                 minTickGap={30}
+                tickFormatter={(value) =>
+                  new Date(value).toLocaleDateString("es-CL", {
+                    month: "short",
+                    day: "numeric",
+                  })
+                }
               />
               <YAxis
                 stroke="var(--chart-muted-foreground)"
@@ -79,9 +87,14 @@ const ForecastChart = ({ data, forecastOnly = false }: ForecastChartProps) => {
                   color: "var(--chart-fg)",
                   borderRadius: 12,
                 }}
-                labelFormatter={(_, payload) =>
-                  payload?.[0]?.payload.fecha?.toLocaleDateString("es-CL") ?? ""
+                labelFormatter={(value) =>
+                  new Date(value).toLocaleDateString("es-CL", {
+                    year: "numeric",
+                    month: "short",
+                    day: "numeric",
+                  })
                 }
+                cursor={{ stroke: "var(--chart-muted)", strokeWidth: 2 }}
               />
               <Legend />
               {hasReal ? (
