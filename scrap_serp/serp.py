@@ -4,13 +4,15 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 
+serp_key = os.getenv("SERP_KEY")
+
 BASE_PARAMS = {
     "engine": "google_flights",
     "arrival_id": "SCL",
     "currency": "CLP",
     "hl": "es",
     "type": 2,
-    "api_key": "f8b5926e9f3674c6cdf272f26a0946814c9c1c471f04bf90fada0d82b234c061",
+    "api_key": serp_key,
 }
 
 AEROPUERTOS_BRASIL = ["GRU", "GIG", "BSB"]
